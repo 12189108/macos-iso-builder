@@ -1,0 +1,88 @@
+name: Build Tahoe AMD VMware package
+run-name: Tahoe AMD VMware (${{ inputs.installer_type }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      installer_type:
+        description: Recovery uses online installation; full is an offline installer
+        type: choice
+        required: true
+        default: recovery
+        options:
+          - recovery
+          - full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tahoe-amd-vmware
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 80
+    env:
+      INSTALLER_TYPE: ${{ inputs.installer_type }}
+      BUNDLE_DIR: out/macOS-Tahoe-AMD
+      MACRECOVERY_COMMIT: 51535b667f288e219b64065d3a2ee6a5e82cb1ae
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check build scripts
+        run: python3 -m py_compile ci/prepare_amd_vm.py ci/validate_and_package.py
+
+      - name: Prepare verified OC4VM AMD template
+        run: python3 ci/prepare_amd_vm.py
+
+      - name: Build Apple recovery ISO
+        if: inputs.installer_type == 'recovery'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 20 \
+            "https://raw.githubusercontent.com/acidanthera/OpenCorePkg/$MACRECOVERY_COMMIT/Utilities/macrecovery/macrecovery.py" \
+            --output "$RUNNER_TEMP/macrecovery.py"
+          python3 "$RUNNER_TEMP/macrecovery.py" \
+            -b Mac-CFF7D910A743CAAF -m 00000000000000000 -os latest \
+            -o "$RUNNER_TEMP/apple-recovery" -n BaseSystem download
+          hdiutil verify "$RUNNER_TEMP/apple-recovery/BaseSystem.dmg"
+          sudo hdiutil makehybrid -hfs -udf \
+            -default-volume-name Tahoe_Recovery \
+            -o "$BUNDLE_DIR/macOS_Tahoe_Recovery.iso" \
+            "$RUNNER_TEMP/apple-recovery/BaseSystem.dmg"
+
+      - name: Build full offline installer with upstream mkmaciso
+        if: inputs.installer_type == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./mkmaciso Tahoe iso "$PWD/$BUNDLE_DIR/macOS_Tahoe_Installer.iso"
+
+      - name: Validate boot files and package the VM
+        run: python3 ci/validate_and_package.py
+
+      - name: Upload ready-to-open VMware package
+        uses: actions/upload-artifact@v7
+        with:
+          name: macOS-Tahoe-AMD-VMware-${{ inputs.installer_type }}
+          path: out/macOS-Tahoe-AMD-VMware.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          archive: false
+
+      - name: Write download and boot instructions
+        shell: bash
+        run: |
+          {
+            echo '## macOS Tahoe AMD VMware package'
+            echo ''
+            echo 'Download **macOS-Tahoe-AMD-VMware.zip** from Artifacts on this run.'
+            echo 'Extract everything into one folder, then open **macos.vmx** in VMware Workstation.'
+            echo 'The AMD OpenCore disk and macOS installation ISO are already attached.'
+            echo ''
+            cat "$BUNDLE_DIR/BUILD-REPORT.md"
+          } >> "$GITHUB_STEP_SUMMARY"
